@@ -6,10 +6,14 @@
 #include <cctype>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <string>
 #include <sstream>
 #include <unordered_map>
 #include <algorithm>
+#include <functional>
+#include <memory>
+#include <vector>
 
 #include <sys/socket.h>
 #include <sys/epoll.h>
@@ -18,6 +22,10 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <pthread.h>
+
+#include "locker.h"
+#include "threadpool.h"
 
 using namespace std;
 
@@ -25,6 +33,8 @@ namespace {
 
 const int PORT = 9006;
 const int MAX_EVENTS = 1024;
+const int THREAD_NUMBER = 4;
+const int MAX_REQUESTS = 1024;
 const size_t MAX_HEADER_SIZE = 8 * 1024;
 const size_t MAX_FILE_SIZE = 8 * 1024 * 1024;
 const char* DOC_ROOT = "root";
@@ -40,16 +50,19 @@ bool setNonBlocking(int fd)
 
 struct Connection {
     explicit Connection(int fd)
-        : m_fd(fd), m_outSent(0), m_closeAfterWrite(false) {}
+        : m_fd(fd), m_outSent(0) {}
 
     int m_fd;
     std::string m_inBuffer;
     std::string m_outBuffer;
     std::size_t m_outSent;
-    bool m_closeAfterWrite;
 };
 
-using ConnectionMap = std::unordered_map<int, Connection>;
+using ConnectionPtr = std::shared_ptr<Connection>;
+using ConnectionMap = std::unordered_map<int, ConnectionPtr>;
+
+ConnectionMap g_connections;
+MutexLock g_connectionsMutex;
 
 enum class IoResult {
     Done,
@@ -84,15 +97,56 @@ bool updateEpoll(int epfd, int fd, uint32_t events)
     return true;
 }
 
-void closeConnection(int epfd, int fd, ConnectionMap& connections)
+ConnectionPtr getConnection(int fd)
 {
+    MutexLockGuard lock(g_connectionsMutex);
+    const auto it = g_connections.find(fd);
+    if (it == g_connections.end()) {
+        return ConnectionPtr();
+    }
+    return it->second;
+}
+
+void closeConnection(int epfd, int fd)
+{
+    bool present = false;
+    {
+        MutexLockGuard lock(g_connectionsMutex);
+        const auto it = g_connections.find(fd);
+        if (it != g_connections.end()) {
+            g_connections.erase(it);
+            present = true;
+        }
+    }
+
+    if (!present) {
+        return;
+    }
+
     if (epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr) == -1) {
         if (errno != ENOENT && errno != EBADF) {
             perror("epoll_ctl DEL fail");
         }
     }
-    connections.erase(fd);
     close(fd);
+}
+
+void closeAllConnections(int epfd)
+{
+    std::vector<int> fds;
+    {
+        MutexLockGuard lock(g_connectionsMutex);
+        fds.reserve(g_connections.size());
+        for (const auto& entry : g_connections) {
+            fds.push_back(entry.first);
+        }
+        g_connections.clear();
+    }
+
+    for (const int fd : fds) {
+        epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
+        close(fd);
+    }
 }
 
 std::string toLower(std::string value)
@@ -186,7 +240,6 @@ void prepareResponse(Connection& conn,
     conn.m_outBuffer += "\r\n";
     conn.m_outBuffer += body;
     conn.m_outSent = 0;
-    conn.m_closeAfterWrite = true;
 }
 
 std::string errorBody(int code, const std::string& reason)
@@ -376,50 +429,38 @@ ParseResult parseRequest(const Connection& conn,
     return ParseResult::Complete;
 }
 
-bool startResponse(Connection& conn, int epfd, ConnectionMap& connections);
+bool startResponse(Connection& conn, int epfd);
 bool sendError(Connection& conn,
                int epfd,
-               ConnectionMap& connections,
                int code,
                const std::string& reason);
-bool handleRequest(Connection& conn, int epfd, ConnectionMap& connections);
-void handleRead(Connection& conn, int epfd, ConnectionMap& connections);
-void acceptConnections(int listenFd, int epfd, ConnectionMap& connections);
+bool handleRequest(Connection& conn, int epfd);
+void handleRead(Connection& conn, int epfd);
+void processConnection(const ConnectionPtr& conn, int epfd);
+void acceptConnections(int listenFd, int epfd);
 
-bool startResponse(Connection& conn, int epfd, ConnectionMap& connections)
+bool startResponse(Connection& conn, int epfd)
 {
     const IoResult result = flushOutput(conn);
     if (result == IoResult::Done) {
-        if (conn.m_closeAfterWrite) {
-            closeConnection(epfd, conn.m_fd, connections);
-            return false;
-        }
-
-        conn.m_inBuffer.clear();
-        conn.m_outBuffer.clear();
-        conn.m_outSent = 0;
-        if (!updateEpoll(epfd, conn.m_fd, EPOLLIN)) {
-            closeConnection(epfd, conn.m_fd, connections);
-            return false;
-        }
-        return true;
+        closeConnection(epfd, conn.m_fd);
+        return false;
     }
 
     if (result == IoResult::Pending) {
-        if (!updateEpoll(epfd, conn.m_fd, EPOLLOUT)) {
-            closeConnection(epfd, conn.m_fd, connections);
+        if (!updateEpoll(epfd, conn.m_fd, EPOLLOUT | EPOLLONESHOT)) {
+            closeConnection(epfd, conn.m_fd);
             return false;
         }
         return true;
     }
 
-    closeConnection(epfd, conn.m_fd, connections);
+    closeConnection(epfd, conn.m_fd);
     return false;
 }
 
 bool sendError(Connection& conn,
                int epfd,
-               ConnectionMap& connections,
                int code,
                const std::string& reason)
 {
@@ -428,10 +469,10 @@ bool sendError(Connection& conn,
                     std::to_string(code) + " " + reason,
                     "text/html; charset=utf-8",
                     errorBody(code, reason));
-    return startResponse(conn, epfd, connections);
+    return startResponse(conn, epfd);
 }
 
-bool handleRequest(Connection& conn, int epfd, ConnectionMap& connections)
+bool handleRequest(Connection& conn, int epfd)
 {
     std::string method;
     std::string target;
@@ -442,19 +483,19 @@ bool handleRequest(Connection& conn, int epfd, ConnectionMap& connections)
         return true;
     }
     if (parsed == ParseResult::TooLarge) {
-        return sendError(conn, epfd, connections, 431,
+        return sendError(conn, epfd, 431,
                          "Request Header Fields Too Large");
     }
     if (parsed == ParseResult::BadRequest) {
-        return sendError(conn, epfd, connections, 400, "Bad Request");
+        return sendError(conn, epfd, 400, "Bad Request");
     }
     if (method != "GET") {
-        return sendError(conn, epfd, connections, 405, "Method Not Allowed");
+        return sendError(conn, epfd, 405, "Method Not Allowed");
     }
 
     std::string filePath;
     if (!buildFilePath(target, filePath)) {
-        return sendError(conn, epfd, connections, 400, "Bad Request");
+        return sendError(conn, epfd, 400, "Bad Request");
     }
 
     std::string body;
@@ -462,21 +503,21 @@ bool handleRequest(Connection& conn, int epfd, ConnectionMap& connections)
     if (file == FileResult::Ok) {
         std::cout << method << ' ' << target << " -> 200" << std::endl;
         prepareResponse(conn, "200 OK", mimeType(filePath), body);
-        return startResponse(conn, epfd, connections);
+        return startResponse(conn, epfd);
     }
     if (file == FileResult::NotFound) {
-        return sendError(conn, epfd, connections, 404, "Not Found");
+        return sendError(conn, epfd, 404, "Not Found");
     }
     if (file == FileResult::Forbidden) {
-        return sendError(conn, epfd, connections, 403, "Forbidden");
+        return sendError(conn, epfd, 403, "Forbidden");
     }
     if (file == FileResult::TooLarge) {
-        return sendError(conn, epfd, connections, 413, "Payload Too Large");
+        return sendError(conn, epfd, 413, "Payload Too Large");
     }
-    return sendError(conn, epfd, connections, 500, "Internal Server Error");
+    return sendError(conn, epfd, 500, "Internal Server Error");
 }
 
-void handleRead(Connection& conn, int epfd, ConnectionMap& connections)
+void handleRead(Connection& conn, int epfd)
 {
     char buffer[4096];
     bool peerClosed = false;
@@ -505,16 +546,16 @@ void handleRead(Connection& conn, int epfd, ConnectionMap& connections)
         }
 
         perror("recv fail");
-        closeConnection(epfd, conn.m_fd, connections);
+        closeConnection(epfd, conn.m_fd);
         return;
     }
 
     if (conn.m_inBuffer.empty()) {
-        closeConnection(epfd, conn.m_fd, connections);
+        closeConnection(epfd, conn.m_fd);
         return;
     }
 
-    const bool alive = handleRequest(conn, epfd, connections);
+    const bool alive = handleRequest(conn, epfd);
     if (!alive) {
         return;
     }
@@ -524,11 +565,41 @@ void handleRead(Connection& conn, int epfd, ConnectionMap& connections)
                         "400 Bad Request",
                         "text/html; charset=utf-8",
                         errorBody(400, "Bad Request"));
-        startResponse(conn, epfd, connections);
+        startResponse(conn, epfd);
+        return;
+    }
+
+    if (conn.m_outBuffer.empty()) {
+        if (!updateEpoll(epfd, conn.m_fd, EPOLLIN | EPOLLONESHOT)) {
+            closeConnection(epfd, conn.m_fd);
+        }
     }
 }
 
-void acceptConnections(int listenFd, int epfd, ConnectionMap& connections)
+void processConnection(const ConnectionPtr& conn, int epfd)
+{
+    std::cout << "worker="
+              << static_cast<unsigned long long>(pthread_self())
+              << " fd=" << conn->m_fd << std::endl;
+
+    if (!conn->m_outBuffer.empty()) {
+        const IoResult result = flushOutput(*conn);
+        if (result == IoResult::Done) {
+            closeConnection(epfd, conn->m_fd);
+        } else if (result == IoResult::Pending) {
+            if (!updateEpoll(epfd, conn->m_fd, EPOLLOUT | EPOLLONESHOT)) {
+                closeConnection(epfd, conn->m_fd);
+            }
+        } else {
+            closeConnection(epfd, conn->m_fd);
+        }
+        return;
+    }
+
+    handleRead(*conn, epfd);
+}
+
+void acceptConnections(int listenFd, int epfd)
 {
     while (true) {
         sockaddr_in clientAddr {};
@@ -553,20 +624,18 @@ void acceptConnections(int listenFd, int epfd, ConnectionMap& connections)
             continue;
         }
 
-        const auto inserted =
-            connections.emplace(clientFd, Connection(clientFd));
-        if (!inserted.second) {
-            close(clientFd);
-            continue;
+        const ConnectionPtr connPtr = std::make_shared<Connection>(clientFd);
+        {
+            MutexLockGuard lock(g_connectionsMutex);
+            g_connections[clientFd] = connPtr;
         }
 
         epoll_event ev {};
-        ev.events = EPOLLIN;
+        ev.events = EPOLLIN | EPOLLONESHOT;
         ev.data.fd = clientFd;
         if (epoll_ctl(epfd, EPOLL_CTL_ADD, clientFd, &ev) == -1) {
             perror("epoll_ctl ADD client fail");
-            connections.erase(clientFd);
-            close(clientFd);
+            closeConnection(epfd, clientFd);
             continue;
         }
 
@@ -635,80 +704,63 @@ int main()
         return 1;
     }
 
-    ConnectionMap connections;
     epoll_event events[MAX_EVENTS];
     bool running = true;
     int exitCode = 0;
 
-    while (running) {
-        const int num = epoll_wait(epfd, events, MAX_EVENTS, -1);
-        if (num == -1) {
-            if (errno == EINTR) {
-                continue;
-            }
-            perror("epoll_wait fail");
-            exitCode = 1;
-            break;
-        }
+    try {
+        ThreadPool<std::function<void()>> threadPool(THREAD_NUMBER, MAX_REQUESTS);
 
-        for (int i = 0; i < num && running; ++i) {
-            const int fd = events[i].data.fd;
-            const uint32_t eventMask = events[i].events;
-
-            if (fd == listenFd) {
-                if (eventMask & (EPOLLERR | EPOLLHUP)) {
-                    std::cerr << "listen fd error" << std::endl;
-                    exitCode = 1;
-                    running = false;
-                    break;
-                }
-                if (eventMask & EPOLLIN) {
-                    acceptConnections(listenFd, epfd, connections);
-                }
-                continue;
-            }
-
-            auto it = connections.find(fd);
-            if (it == connections.end()) {
-                epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
-                continue;
-            }
-
-            if (eventMask & EPOLLERR) {
-                closeConnection(epfd, fd, connections);
-                continue;
-            }
-
-            if (eventMask & EPOLLIN) {
-                handleRead(it->second, epfd, connections);
-                if (connections.find(fd) == connections.end()) {
+        while (running) {
+            const int num = epoll_wait(epfd, events, MAX_EVENTS, -1);
+            if (num == -1) {
+                if (errno == EINTR) {
                     continue;
                 }
+                perror("epoll_wait fail");
+                exitCode = 1;
+                break;
             }
 
-            if (eventMask & EPOLLOUT) {
-                auto writeIt = connections.find(fd);
-                if (writeIt == connections.end()) {
-                    continue;
-                }
-                const IoResult result = flushOutput(writeIt->second);
-                if (result == IoResult::Done || result == IoResult::Error) {
-                    closeConnection(epfd, fd, connections);
-                    continue;
-                }
-            }
+            for (int i = 0; i < num && running; ++i) {
+                const int fd = events[i].data.fd;
+                const uint32_t eventMask = events[i].events;
 
-            if ((eventMask & EPOLLHUP) &&
-                connections.find(fd) != connections.end()) {
-                closeConnection(epfd, fd, connections);
+                if (fd == listenFd) {
+                    if (eventMask & (EPOLLERR | EPOLLHUP)) {
+                        std::cerr << "listen fd error" << std::endl;
+                        exitCode = 1;
+                        running = false;
+                        break;
+                    }
+                    if (eventMask & EPOLLIN) {
+                        acceptConnections(listenFd, epfd);
+                    }
+                    continue;
+                }
+
+                const ConnectionPtr conn = getConnection(fd);
+                if (!conn) {
+                    epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
+                    continue;
+                }
+
+                const auto task = [conn, epfd]() {
+                    processConnection(conn, epfd);
+                };
+                if (!threadPool.append(task)) {
+                    std::cerr << "thread pool queue full, close fd=" << fd
+                              << std::endl;
+                    closeConnection(epfd, fd);
+                }
             }
         }
+    } catch (const std::exception& error) {
+        std::cerr << "thread pool init fail: " << error.what() << std::endl;
+        exitCode = 1;
     }
 
-    for (const auto& entry : connections) {
-        close(entry.first);
-    }
-    connections.clear();
+    closeAllConnections(epfd);
     close(epfd);
     close(listenFd);
     return exitCode;
